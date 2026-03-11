@@ -62,6 +62,25 @@ def status(ctx):
         print("\nAll notes are up to date.")
 
 
+@cli.command(name="discover-links")
+@click.option("--min-tags", default=2, help="Minimum shared tags to consider a pair (default: 2)")
+@click.option("--verbose", "-v", is_flag=True, help="Show agent debug output")
+@click.option("--think/--no-think", default=False, help="Enable model thinking")
+@click.pass_context
+def discover_links(ctx, min_tags, verbose, think):
+    """Discover links between notes based on shared tags (run after tagging)."""
+    from vault_agent.agent import Agent
+    from vault_agent.ollama_client import OllamaClient
+    from vault_agent.state import VaultState
+
+    vault_path = ctx.obj["vault_path"]
+    client = OllamaClient(base_url=ctx.obj["ollama_url"], model=ctx.obj["model"], verbose=verbose, think=think)
+    state = VaultState(vault_path)
+    agent = Agent(vault_path=vault_path, client=client, state=state, verbose=verbose)
+
+    agent.discover_links(min_shared_tags=min_tags)
+
+
 @cli.command()
 @click.pass_context
 def proposals(ctx):
