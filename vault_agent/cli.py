@@ -22,15 +22,16 @@ def cli(ctx, vault, model, ollama_url):
 @cli.command()
 @click.option("--force", is_flag=True, help="Re-process all notes, ignoring state")
 @click.option("--verbose", "-v", is_flag=True, help="Show agent debug output")
+@click.option("--think/--no-think", default=False, help="Enable model thinking (slow, disabled by default)")
 @click.pass_context
-def run(ctx, force, verbose):
+def run(ctx, force, verbose, think):
     """Process vault notes — extract tags and discover links."""
     from vault_agent.agent import Agent
     from vault_agent.ollama_client import OllamaClient
     from vault_agent.state import VaultState
 
     vault_path = ctx.obj["vault_path"]
-    client = OllamaClient(base_url=ctx.obj["ollama_url"], model=ctx.obj["model"])
+    client = OllamaClient(base_url=ctx.obj["ollama_url"], model=ctx.obj["model"], verbose=verbose, think=think)
     state = VaultState(vault_path)
     agent = Agent(vault_path=vault_path, client=client, state=state, verbose=verbose)
 
