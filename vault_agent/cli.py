@@ -1,0 +1,224 @@
+"""CLI entry point for the vault agent."""
+
+import click
+from pathlib import Path
+
+from vault_agent.config import DEFAULT_VAULT_PATH, DEFAULT_OLLAMA_URL, DEFAULT_MODEL
+
+
+@click.group()
+@click.option("--vault", type=click.Path(exists=True), default=str(DEFAULT_VAULT_PATH), help="Path to Obsidian vault")
+@click.option("--model", default=DEFAULT_MODEL, help="Ollama model name")
+@click.option("--ollama-url", default=DEFAULT_OLLAMA_URL, help="Ollama API URL")
+@click.pass_context
+def cli(ctx, vault, model, ollama_url):
+    """Vault Agent — local LLM-powered Obsidian link discovery and tagging."""
+    ctx.ensure_object(dict)
+    ctx.obj["vault_path"] = Path(vault)
+    ctx.obj["model"] = model
+    ctx.obj["ollama_url"] = ollama_url
+
+
+@cli.command()
+@click.option("--force", is_flag=True, help="Re-process all notes, ignoring state")
+@click.option("--verbose", "-v", is_flag=True, help="Show agent debug output")
+@click.pass_context
+def run(ctx, force, verbose):
+    """Process vault notes — extract tags and discover links."""
+    from vault_agent.agent import Agent
+    from vault_agent.ollama_client import OllamaClient
+    from vault_agent.state import VaultState
+
+    vault_path = ctx.obj["vault_path"]
+    client = OllamaClient(base_url=ctx.obj["ollama_url"], model=ctx.obj["model"])
+    state = VaultState(vault_path)
+    agent = Agent(vault_path=vault_path, client=client, state=state, verbose=verbose)
+
+    agent.run(force=force)
+
+
+@cli.command()
+@click.pass_context
+def status(ctx):
+    """Show processing status and pending proposals."""
+    from vault_agent.state import VaultState
+
+    vault_path = ctx.obj["vault_path"]
+    state = VaultState(vault_path)
+
+    print("=== Vault Agent Status ===\n")
+    print(state.summary())
+
+    # Count unprocessed notes
+    to_process = state.get_notes_to_process()
+    if to_process:
+        print(f"\nNotes needing processing: {len(to_process)}")
+        for n in to_process[:10]:
+            print(f"  - {n}")
+        if len(to_process) > 10:
+            print(f"  ... and {len(to_process) - 10} more")
+    else:
+        print("\nAll notes are up to date.")
+
+
+@cli.command()
+@click.pass_context
+def proposals(ctx):
+    """Show all pending tag and link proposals."""
+    from vault_agent.state import VaultState
+
+    vault_path = ctx.obj["vault_path"]
+    state = VaultState(vault_path)
+
+    pending_tags = state.get_pending_tags()
+    pending_links = state.get_pending_links()
+
+    if not pending_tags and not pending_links:
+        print("No pending proposals.")
+        return
+
+    if pending_tags:
+        print("=== Pending Tag Proposals ===\n")
+        for path, tags in pending_tags.items():
+            tag_str = ", ".join(f"#{t}" for t in tags)
+            print(f"  {path}: {tag_str}")
+        print()
+
+    if pending_links:
+        print("=== Pending Link Proposals ===\n")
+        for path, links in pending_links.items():
+            print(f"  {path}:")
+            for link in links:
+                print(f"    -> [[{link['target']}]] — {link.get('reason', '')}")
+        print()
+
+
+@cli.command(name="apply-tags")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+@click.pass_context
+def apply_tags(ctx, yes):
+    """Apply all pending tag proposals to notes."""
+    from vault_agent.state import VaultState
+
+    vault_path = ctx.obj["vault_path"]
+    state = VaultState(vault_path)
+    pending = state.get_pending_tags()
+
+    if not pending:
+        print("No pending tag proposals.")
+        return
+
+    print(f"Will apply tags to {len(pending)} note(s):\n")
+    for path, tags in pending.items():
+        tag_str = ", ".join(f"#{t}" for t in tags)
+        print(f"  {path}: {tag_str}")
+
+    if not yes:
+        click.confirm("\nProceed?", abort=True)
+
+    for path, tags in pending.items():
+        filepath = vault_path / path
+        if not filepath.exists():
+            print(f"  Skipping {path} (file not found)")
+            continue
+
+        content = filepath.read_text(encoding="utf-8")
+
+        # Build or update frontmatter tags
+        if content.startswith("---"):
+            end = content.find("---", 3)
+            if end != -1:
+                fm = content[3:end]
+                body = content[end + 3:]
+                if "tags:" in fm:
+                    # Merge with existing tags
+                    import re
+                    match = re.search(r'tags:\s*\[([^\]]*)\]', fm)
+                    if match:
+                        existing = [t.strip().strip('"').strip("'") for t in match.group(1).split(",") if t.strip()]
+                        merged = sorted(set(existing + tags))
+                        tag_list = ", ".join(merged)
+                        fm = re.sub(r'tags:\s*\[[^\]]*\]', f'tags: [{tag_list}]', fm)
+                    else:
+                        # tags as list items
+                        tag_lines = "\n".join(f"  - {t}" for t in sorted(set(tags)))
+                        fm = fm.rstrip() + f"\ntags:\n{tag_lines}\n"
+                else:
+                    tag_list = ", ".join(sorted(tags))
+                    fm = fm.rstrip() + f"\ntags: [{tag_list}]\n"
+                content = f"---{fm}---{body}"
+            else:
+                tag_list = ", ".join(sorted(tags))
+                content = f"---\ntags: [{tag_list}]\n---\n{content}"
+        else:
+            tag_list = ", ".join(sorted(tags))
+            content = f"---\ntags: [{tag_list}]\n---\n{content}"
+
+        filepath.write_text(content, encoding="utf-8")
+        state.mark_tags_applied(path)
+        print(f"  Applied tags to {path}")
+
+    state.save()
+    print("\nDone!")
+
+
+@cli.command(name="apply-links")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+@click.pass_context
+def apply_links(ctx, yes):
+    """Apply all pending link proposals to notes."""
+    from vault_agent.state import VaultState
+
+    vault_path = ctx.obj["vault_path"]
+    state = VaultState(vault_path)
+    pending = state.get_pending_links()
+
+    if not pending:
+        print("No pending link proposals.")
+        return
+
+    print(f"Will add links to {len(pending)} note(s):\n")
+    for path, links in pending.items():
+        print(f"  {path}:")
+        for link in links:
+            print(f"    -> [[{link['target']}]] — {link.get('reason', '')}")
+
+    if not yes:
+        click.confirm("\nProceed?", abort=True)
+
+    for path, links in pending.items():
+        filepath = vault_path / path
+        if not filepath.exists():
+            print(f"  Skipping {path} (file not found)")
+            continue
+
+        content = filepath.read_text(encoding="utf-8")
+
+        # Append a "Related Notes" section
+        link_lines = []
+        for link in links:
+            target = link["target"].replace(".md", "")
+            reason = link.get("reason", "")
+            if reason:
+                link_lines.append(f"- [[{target}]] — {reason}")
+            else:
+                link_lines.append(f"- [[{target}]]")
+
+        section = "\n\n## Related Notes\n" + "\n".join(link_lines)
+
+        if "## Related Notes" in content:
+            # Append to existing section
+            content = content.rstrip() + "\n" + "\n".join(link_lines)
+        else:
+            content = content.rstrip() + section
+
+        filepath.write_text(content, encoding="utf-8")
+        state.mark_links_applied(path)
+        print(f"  Added {len(links)} link(s) to {path}")
+
+    state.save()
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    cli()

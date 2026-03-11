@@ -1,0 +1,16 @@
+[project]
+name = "vault-agent"
+version = "0.1.0"
+description = "Local agentic tool for Obsidian vault link discovery and tagging"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "click>=8.0",
+]
+
+[project.scripts]
+vault-agent = "vault_agent.cli:cli"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
