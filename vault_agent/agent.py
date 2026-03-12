@@ -148,52 +148,63 @@ class Agent:
         errors = 0
         start_time = time.time()
 
-        for i, note_path in enumerate(notes, 1):
-            elapsed = time.time() - start_time
-            if i > 1:
-                avg_per_note = elapsed / (i - 1)
-                remaining = avg_per_note * (total - i + 1)
-                mins = int(remaining // 60)
-                secs = int(remaining % 60)
-                eta = f"~{mins}m{secs:02d}s remaining"
-            else:
-                eta = "estimating..."
+        try:
+            for i, note_path in enumerate(notes, 1):
+                elapsed = time.time() - start_time
+                if i > 1:
+                    avg_per_note = elapsed / (i - 1)
+                    remaining = avg_per_note * (total - i + 1)
+                    mins = int(remaining // 60)
+                    secs = int(remaining % 60)
+                    eta = f"~{mins}m{secs:02d}s remaining"
+                else:
+                    eta = "estimating..."
 
-            # Progress bar
-            bar_width = 30
-            filled = int(bar_width * i / total)
-            bar = "=" * filled + ">" + " " * (bar_width - filled - 1)
-            pct = int(100 * i / total)
-            print(f"[{i}/{total}] Processing \"{note_path}\"...")
-            print(f"  [{bar}] {pct}% | {eta}")
+                # Progress bar
+                bar_width = 30
+                filled = int(bar_width * i / total)
+                bar = "=" * filled + ">" + " " * (bar_width - filled - 1)
+                pct = int(100 * i / total)
+                print(f"[{i}/{total}] Processing \"{note_path}\"...")
+                print(f"  [{bar}] {pct}% | {eta}")
 
-            if progress_callback:
-                progress_callback(i, total, note_path)
+                if progress_callback:
+                    progress_callback(i, total, note_path)
 
-            result = self.process_note(note_path)
+                result = self.process_note(note_path)
 
-            if result:
-                content_hash = self.state.get_content_hash(note_path)
-                tags = result.get("tags", [])
-                links = result.get("links", [])
+                if result:
+                    content_hash = self.state.get_content_hash(note_path)
+                    tags = result.get("tags", [])
+                    links = result.get("links", [])
 
-                self.state.mark_processed(
-                    note_path=note_path,
-                    content_hash=content_hash,
-                    proposed_tags=tags,
-                    proposed_links=links,
-                )
-                self.state.save()  # Save after each note for resume support
+                    self.state.mark_processed(
+                        note_path=note_path,
+                        content_hash=content_hash,
+                        proposed_tags=tags,
+                        proposed_links=links,
+                    )
+                    self.state.save()  # Save after each note for resume support
 
-                tag_str = ", ".join(f"#{t}" for t in tags) if tags else "none"
-                print(f"  Tags: {tag_str}")
-                print(f"  Links: {len(links)} suggested")
-                processed += 1
-            else:
-                print(f"  Error: failed to process")
-                errors += 1
+                    tag_str = ", ".join(f"#{t}" for t in tags) if tags else "none"
+                    print(f"  Tags: {tag_str}")
+                    print(f"  Links: {len(links)} suggested")
+                    processed += 1
+                else:
+                    print(f"  Error: failed to process")
+                    errors += 1
 
-            print()
+                print()
+
+        except KeyboardInterrupt:
+            self.state.save()
+            total_time = time.time() - start_time
+            mins = int(total_time // 60)
+            secs = int(total_time % 60)
+            remaining_count = total - i
+            print(f"\n\nInterrupted! {processed} processed, {errors} errors in {mins}m{secs:02d}s")
+            print(f"{remaining_count} note(s) remaining — run again to resume.")
+            return {"processed": processed, "skipped": remaining_count, "errors": errors, "interrupted": True}
 
         self.state.mark_run_completed()
         self.state.save()
@@ -305,6 +316,9 @@ Respond with JSON only:
     def discover_links(self, min_shared_tags: int = 2) -> dict:
         """Discover links between notes based on tag overlap, confirmed by LLM.
 
+        Resumable — tracks evaluated pairs in state so interrupted runs
+        pick up where they left off. Use --force to re-evaluate all pairs.
+
         Returns a summary dict.
         """
         candidates = self._find_candidate_pairs(min_shared_tags)
@@ -314,66 +328,100 @@ Respond with JSON only:
             print("Run 'vault-agent run' first to extract tags.")
             return {"candidates": 0, "confirmed": 0, "skipped": 0}
 
-        print(f"Found {len(candidates)} candidate pair(s) with {min_shared_tags}+ shared tags.\n")
+        # Filter out already-evaluated pairs
+        remaining = [
+            (a, b, tags) for a, b, tags in candidates
+            if not self.state.is_pair_evaluated(a, b)
+        ]
+        already_done = len(candidates) - len(remaining)
+
+        if already_done > 0:
+            print(f"Found {len(candidates)} candidate pair(s), {already_done} already evaluated.")
+            print(f"Resuming with {len(remaining)} remaining pair(s).\n")
+        else:
+            print(f"Found {len(candidates)} candidate pair(s) with {min_shared_tags}+ shared tags.\n")
+
+        if not remaining:
+            print("All pairs already evaluated. Use --force to re-evaluate.")
+            return {"candidates": len(candidates), "confirmed": 0, "skipped": 0}
 
         confirmed = 0
         skipped = 0
+        evaluated = 0
         start_time = time.time()
 
-        for i, (note_a, note_b, shared_tags) in enumerate(candidates, 1):
-            # Skip if already linked
-            links_a = self._get_existing_links(note_a)
-            links_b = self._get_existing_links(note_b)
-            name_a = Path(note_a).stem
-            name_b = Path(note_b).stem
+        try:
+            for i, (note_a, note_b, shared_tags) in enumerate(remaining, 1):
+                # Skip if already linked in the actual note content
+                links_a = self._get_existing_links(note_a)
+                links_b = self._get_existing_links(note_b)
+                name_a = Path(note_a).stem
+                name_b = Path(note_b).stem
 
-            if name_b in links_a or name_a in links_b:
-                self._log(f"Already linked: {note_a} <-> {note_b}")
-                skipped += 1
-                continue
+                if name_b in links_a or name_a in links_b:
+                    self._log(f"Already linked: {note_a} <-> {note_b}")
+                    self.state.mark_pair_evaluated(note_a, note_b)
+                    skipped += 1
+                    evaluated += 1
+                    continue
 
-            elapsed = time.time() - start_time
-            if i > 1:
-                avg = elapsed / (i - 1)
-                remaining = avg * (len(candidates) - i + 1)
-                mins = int(remaining // 60)
-                secs = int(remaining % 60)
-                eta = f"~{mins}m{secs:02d}s remaining"
-            else:
-                eta = "estimating..."
+                elapsed = time.time() - start_time
+                if evaluated > 0:
+                    avg = elapsed / evaluated
+                    eta_remaining = avg * (len(remaining) - i + 1)
+                    mins = int(eta_remaining // 60)
+                    secs = int(eta_remaining % 60)
+                    eta = f"~{mins}m{secs:02d}s remaining"
+                else:
+                    eta = "estimating..."
 
-            pct = int(100 * i / len(candidates))
-            print(f"[{i}/{len(candidates)}] {note_a} <-> {note_b}")
-            print(f"  Shared tags: {', '.join(f'#{t}' for t in shared_tags)}")
-            print(f"  [{pct}%] {eta}")
+                overall_i = already_done + i
+                pct = int(100 * overall_i / len(candidates))
+                print(f"[{overall_i}/{len(candidates)}] {note_a} <-> {note_b}")
+                print(f"  Shared tags: {', '.join(f'#{t}' for t in shared_tags)}")
+                print(f"  [{pct}%] {eta}")
 
-            result = self.confirm_link(note_a, note_b, shared_tags)
+                result = self.confirm_link(note_a, note_b, shared_tags)
 
-            if result:
-                link_from = result.get("link_from", note_a)
-                link_to = result.get("link_to", note_b)
-                reason = result.get("reason", "")
+                # Mark as evaluated regardless of outcome
+                self.state.mark_pair_evaluated(note_a, note_b)
 
-                # Store in state under the source note
-                note_info = self.state.data["notes"].get(link_from, {})
-                existing_links = note_info.get("proposed_links", [])
-                existing_links.append({
-                    "target": link_to,
-                    "reason": reason,
-                })
-                note_info["proposed_links"] = existing_links
-                note_info["links_applied"] = False
-                self.state.data["notes"][link_from] = note_info
-                self.state.save()
+                if result:
+                    link_from = result.get("link_from", note_a)
+                    link_to = result.get("link_to", note_b)
+                    reason = result.get("reason", "")
 
-                print(f"  -> LINK: [[{Path(link_to).stem}]] in {link_from}")
-                print(f"     Reason: {reason}")
-                confirmed += 1
-            else:
-                print(f"  -> No link needed")
-                skipped += 1
+                    # Store in state under the source note
+                    note_info = self.state.data["notes"].get(link_from, {})
+                    existing_links = note_info.get("proposed_links", [])
+                    existing_links.append({
+                        "target": link_to,
+                        "reason": reason,
+                    })
+                    note_info["proposed_links"] = existing_links
+                    note_info["links_applied"] = False
+                    self.state.data["notes"][link_from] = note_info
 
-            print()
+                    print(f"  -> LINK: [[{Path(link_to).stem}]] in {link_from}")
+                    print(f"     Reason: {reason}")
+                    confirmed += 1
+                else:
+                    print(f"  -> No link needed")
+                    skipped += 1
+
+                evaluated += 1
+                self.state.save()  # Save after each pair for resume support
+                print()
+
+        except KeyboardInterrupt:
+            self.state.save()
+            total_time = time.time() - start_time
+            mins = int(total_time // 60)
+            secs = int(total_time % 60)
+            remaining_count = len(remaining) - i
+            print(f"\n\nInterrupted! {confirmed} links confirmed, {skipped} skipped in {mins}m{secs:02d}s")
+            print(f"{remaining_count} pair(s) remaining — run again to resume.")
+            return {"candidates": len(candidates), "confirmed": confirmed, "skipped": skipped, "interrupted": True}
 
         total_time = time.time() - start_time
         mins = int(total_time // 60)

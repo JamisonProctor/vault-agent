@@ -27,10 +27,14 @@ class VaultState:
     def _load(self) -> dict:
         """Load state from disk, or return empty state."""
         if self.state_file.exists():
-            return json.loads(self.state_file.read_text(encoding="utf-8"))
+            data = json.loads(self.state_file.read_text(encoding="utf-8"))
+            # Ensure evaluated_pairs exists (added in v1.1)
+            data.setdefault("evaluated_pairs", [])
+            return data
         return {
             "version": 1,
             "notes": {},
+            "evaluated_pairs": [],
             "last_run": None,
             "last_completed_run": None,
         }
@@ -91,6 +95,22 @@ class VaultState:
             "tags_applied": False,
             "links_applied": False,
         }
+
+    def is_pair_evaluated(self, note_a: str, note_b: str) -> bool:
+        """Check if a candidate pair has already been evaluated."""
+        key = "|".join(sorted([note_a, note_b]))
+        return key in set(self.data.get("evaluated_pairs", []))
+
+    def mark_pair_evaluated(self, note_a: str, note_b: str) -> None:
+        """Record that a candidate pair has been evaluated (linked or rejected)."""
+        key = "|".join(sorted([note_a, note_b]))
+        pairs = self.data.setdefault("evaluated_pairs", [])
+        if key not in pairs:
+            pairs.append(key)
+
+    def clear_evaluated_pairs(self) -> None:
+        """Reset evaluated pairs tracking (for full re-evaluation)."""
+        self.data["evaluated_pairs"] = []
 
     def mark_run_started(self) -> None:
         self.data["last_run"] = time.time()

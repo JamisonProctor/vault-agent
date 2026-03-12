@@ -64,10 +64,11 @@ def status(ctx):
 
 @cli.command(name="discover-links")
 @click.option("--min-tags", default=2, help="Minimum shared tags to consider a pair (default: 2)")
+@click.option("--force", is_flag=True, help="Re-evaluate all pairs, ignoring previous progress")
 @click.option("--verbose", "-v", is_flag=True, help="Show agent debug output")
 @click.option("--think/--no-think", default=False, help="Enable model thinking")
 @click.pass_context
-def discover_links(ctx, min_tags, verbose, think):
+def discover_links(ctx, min_tags, force, verbose, think):
     """Discover links between notes based on shared tags (run after tagging)."""
     from vault_agent.agent import Agent
     from vault_agent.ollama_client import OllamaClient
@@ -76,6 +77,11 @@ def discover_links(ctx, min_tags, verbose, think):
     vault_path = ctx.obj["vault_path"]
     client = OllamaClient(base_url=ctx.obj["ollama_url"], model=ctx.obj["model"], verbose=verbose, think=think)
     state = VaultState(vault_path)
+
+    if force:
+        state.clear_evaluated_pairs()
+        state.save()
+
     agent = Agent(vault_path=vault_path, client=client, state=state, verbose=verbose)
 
     agent.discover_links(min_shared_tags=min_tags)
