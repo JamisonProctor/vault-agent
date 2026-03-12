@@ -7,6 +7,7 @@ content hashes for change detection, and proposed tags/links.
 import hashlib
 import json
 import time
+from collections import defaultdict
 from pathlib import Path
 
 from vault_agent.config import STATE_FILENAME
@@ -146,3 +147,164 @@ class VaultState:
         else:
             lines.append("Last completed run: never")
         return "\n".join(lines)
+
+    # --- Validation ---
+
+    def _get_all_vault_files(self) -> set[str]:
+        """Return set of all .md file paths relative to vault root."""
+        return {
+            str(p.relative_to(self.vault_path))
+            for p in self.vault_path.rglob("*.md")
+            if not p.name.startswith(".")
+        }
+
+    def _fuzzy_match_target(self, bad_target: str, valid_files: set[str]) -> str | None:
+        """Try to fuzzy-match a bad link target to a real file.
+
+        Strategies:
+        1. Case-insensitive match
+        2. Substring match on filename
+        3. Levenshtein distance on filename (threshold <= 3)
+        """
+        from vault_agent.tags import _levenshtein
+
+        bad_name = Path(bad_target).name.lower()
+        bad_stem = Path(bad_target).stem.lower()
+
+        # Build lookup structures
+        name_to_path: dict[str, str] = {}
+        for f in valid_files:
+            name_to_path[Path(f).name.lower()] = f
+
+        # Strategy 1: exact filename, case-insensitive
+        if bad_name in name_to_path:
+            return name_to_path[bad_name]
+
+        # Strategy 2: stem match (ignore .md extension issues)
+        for f in valid_files:
+            if Path(f).stem.lower() == bad_stem:
+                return f
+
+        # Strategy 3: Levenshtein on stems
+        best_match = None
+        best_dist = 4  # threshold
+        for f in valid_files:
+            dist = _levenshtein(bad_stem, Path(f).stem.lower())
+            if dist < best_dist:
+                best_dist = dist
+                best_match = f
+
+        return best_match
+
+    def validate_links(self, fix: bool = False) -> dict:
+        """Validate all proposed link targets exist as real files.
+
+        Args:
+            fix: If True, attempt to correct bad targets via fuzzy matching
+                 and remove links that can't be fixed.
+
+        Returns:
+            dict with validation results:
+            - valid: count of valid links
+            - invalid: count of invalid links
+            - fixed: count of links corrected (when fix=True)
+            - removed: count of links removed (when fix=True)
+            - details: list of (note_path, target, status, correction) tuples
+        """
+        valid_files = self._get_all_vault_files()
+        results = {
+            "valid": 0,
+            "invalid": 0,
+            "fixed": 0,
+            "removed": 0,
+            "details": [],
+        }
+
+        for note_path, info in self.data["notes"].items():
+            proposed = info.get("proposed_links", [])
+            if not proposed:
+                continue
+
+            cleaned_links = []
+            for link in proposed:
+                target = link.get("target", "")
+                if target in valid_files:
+                    results["valid"] += 1
+                    cleaned_links.append(link)
+                    continue
+
+                # Also check if stem.md matches (LLM might omit folder path)
+                stem_match = None
+                for f in valid_files:
+                    if Path(f).name == target or Path(f).name == target + ".md":
+                        stem_match = f
+                        break
+
+                if stem_match:
+                    results["valid"] += 1
+                    if fix:
+                        link["target"] = stem_match
+                        results["fixed"] += 1
+                        results["details"].append((note_path, target, "fixed", stem_match))
+                    cleaned_links.append(link)
+                    continue
+
+                # Try fuzzy match
+                fuzzy = self._fuzzy_match_target(target, valid_files)
+                if fuzzy and fix:
+                    link["target"] = fuzzy
+                    results["fixed"] += 1
+                    results["details"].append((note_path, target, "fixed", fuzzy))
+                    cleaned_links.append(link)
+                elif fuzzy:
+                    results["invalid"] += 1
+                    results["details"].append((note_path, target, "fixable", fuzzy))
+                else:
+                    results["invalid"] += 1
+                    if fix:
+                        results["removed"] += 1
+                        results["details"].append((note_path, target, "removed", None))
+                    else:
+                        results["details"].append((note_path, target, "invalid", None))
+
+            if fix:
+                info["proposed_links"] = cleaned_links
+                if not cleaned_links:
+                    info["links_applied"] = False
+
+        if fix:
+            self.save()
+
+        return results
+
+    # --- Tag normalization ---
+
+    def apply_tag_normalization(self, mapping: dict[str, str]) -> int:
+        """Apply a tag normalization mapping to all proposed tags in state.
+
+        Args:
+            mapping: dict of variant_tag -> canonical_tag
+
+        Returns:
+            Number of tag replacements made.
+        """
+        replacements = 0
+        for info in self.data["notes"].values():
+            tags = info.get("proposed_tags", [])
+            new_tags = []
+            for tag in tags:
+                canonical = mapping.get(tag, tag)
+                if canonical != tag:
+                    replacements += 1
+                new_tags.append(canonical)
+            # Deduplicate while preserving order
+            seen = set()
+            deduped = []
+            for t in new_tags:
+                if t not in seen:
+                    seen.add(t)
+                    deduped.append(t)
+            info["proposed_tags"] = deduped
+
+        self.save()
+        return replacements

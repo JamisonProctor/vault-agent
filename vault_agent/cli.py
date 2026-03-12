@@ -113,6 +113,95 @@ def proposals(ctx):
         print()
 
 
+@cli.command()
+@click.option("--fix", is_flag=True, help="Auto-fix bad targets (fuzzy match) and remove unfixable ones")
+@click.pass_context
+def validate(ctx, fix):
+    """Validate proposed link targets exist as real files."""
+    from vault_agent.state import VaultState
+
+    vault_path = ctx.obj["vault_path"]
+    state = VaultState(vault_path)
+
+    action = "Validating and fixing" if fix else "Validating"
+    print(f"{action} proposed link targets...\n")
+
+    results = state.validate_links(fix=fix)
+
+    print(f"Valid links:   {results['valid']}")
+    print(f"Invalid links: {results['invalid']}")
+    if fix:
+        print(f"Fixed:         {results['fixed']}")
+        print(f"Removed:       {results['removed']}")
+
+    # Show details
+    details = results["details"]
+    if details:
+        print()
+        for note_path, target, status, correction in details:
+            if status == "fixed":
+                print(f"  FIXED   {note_path}")
+                print(f"          {target} -> {correction}")
+            elif status == "fixable":
+                print(f"  FIXABLE {note_path}")
+                print(f"          {target} -> {correction}")
+                print(f"          (run with --fix to correct)")
+            elif status == "removed":
+                print(f"  REMOVED {note_path}")
+                print(f"          {target} (no match found)")
+            else:
+                print(f"  INVALID {note_path}")
+                print(f"          {target} (no match found)")
+
+    if not fix and results["invalid"] > 0:
+        print(f"\nRun 'vault-agent validate --fix' to auto-correct fixable targets and remove the rest.")
+
+
+@cli.command(name="normalize-tags")
+@click.option("--apply", is_flag=True, help="Apply the normalization (default: preview only)")
+@click.option("--threshold", default=2, help="Levenshtein distance threshold for fuzzy matching (default: 2)")
+@click.pass_context
+def normalize_tags(ctx, apply, threshold):
+    """Preview and apply tag normalization to merge near-duplicates."""
+    from vault_agent.state import VaultState
+    from vault_agent.tags import build_normalization_map, get_tag_counts
+
+    vault_path = ctx.obj["vault_path"]
+    state = VaultState(vault_path)
+
+    tag_counts = get_tag_counts(state.data)
+    total_unique = len(tag_counts)
+
+    mapping = build_normalization_map(tag_counts, distance_threshold=threshold)
+
+    if not mapping:
+        print(f"{total_unique} unique tags found. No near-duplicates detected.")
+        return
+
+    # Group by canonical tag for display
+    from collections import defaultdict
+    groups: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for variant, canonical in mapping.items():
+        groups[canonical].append((variant, tag_counts.get(variant, 0)))
+
+    print(f"{total_unique} unique tags found. {len(mapping)} tags will be merged:\n")
+    for canonical, variants in sorted(groups.items()):
+        canonical_count = tag_counts.get(canonical, 0)
+        print(f"  #{canonical} ({canonical_count} notes) <-")
+        for variant, count in sorted(variants, key=lambda x: -x[1]):
+            print(f"    #{variant} ({count} notes)")
+
+    after_count = total_unique - len(mapping)
+    print(f"\nBefore: {total_unique} unique tags")
+    print(f"After:  {after_count} unique tags (-{len(mapping)})")
+
+    if apply:
+        replacements = state.apply_tag_normalization(mapping)
+        print(f"\nApplied {replacements} tag replacements across all notes.")
+    else:
+        print(f"\nThis is a preview. Run with --apply to make changes.")
+
+
 @cli.command(name="apply-tags")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
