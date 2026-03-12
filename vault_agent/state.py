@@ -297,6 +297,54 @@ class VaultState:
 
         return results
 
+    # --- Link cleanup ---
+
+    def deduplicate_links(self) -> int:
+        """Remove duplicate proposed links (same from->target).
+
+        Keeps the link with the longest reason when duplicates exist.
+        Returns number of duplicates removed.
+        """
+        removed = 0
+        for info in self.data["notes"].values():
+            links = info.get("proposed_links", [])
+            if len(links) <= 1:
+                continue
+
+            seen: dict[str, dict] = {}
+            for link in links:
+                target = link.get("target", "")
+                if target in seen:
+                    # Keep the one with the longer reason
+                    existing_reason = seen[target].get("reason", "")
+                    new_reason = link.get("reason", "")
+                    if len(new_reason) > len(existing_reason):
+                        seen[target] = link
+                    removed += 1
+                else:
+                    seen[target] = link
+
+            info["proposed_links"] = list(seen.values())
+
+        if removed:
+            self.save()
+        return removed
+
+    def remove_self_links(self) -> int:
+        """Remove links where a note links to itself."""
+        removed = 0
+        for path, info in self.data["notes"].items():
+            links = info.get("proposed_links", [])
+            original_count = len(links)
+            info["proposed_links"] = [
+                l for l in links if l.get("target", "") != path
+            ]
+            removed += original_count - len(info["proposed_links"])
+
+        if removed:
+            self.save()
+        return removed
+
     # --- Tag normalization ---
 
     def apply_tag_normalization(self, mapping: dict[str, str]) -> int:

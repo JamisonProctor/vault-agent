@@ -64,11 +64,12 @@ def status(ctx):
 
 @cli.command(name="discover-links")
 @click.option("--min-tags", default=2, help="Minimum shared tags to consider a pair (default: 2)")
+@click.option("--max-tag-freq", default=10, help="Ignore tags on more than N notes — too generic to be useful (default: 10)")
 @click.option("--force", is_flag=True, help="Re-evaluate all pairs, ignoring previous progress")
 @click.option("--verbose", "-v", is_flag=True, help="Show agent debug output")
 @click.option("--think/--no-think", default=False, help="Enable model thinking")
 @click.pass_context
-def discover_links(ctx, min_tags, force, verbose, think):
+def discover_links(ctx, min_tags, max_tag_freq, force, verbose, think):
     """Discover links between notes based on shared tags (run after tagging)."""
     from vault_agent.agent import Agent
     from vault_agent.ollama_client import OllamaClient
@@ -84,7 +85,7 @@ def discover_links(ctx, min_tags, force, verbose, think):
 
     agent = Agent(vault_path=vault_path, client=client, state=state, verbose=verbose)
 
-    agent.discover_links(min_shared_tags=min_tags)
+    agent.discover_links(min_shared_tags=min_tags, max_tag_frequency=max_tag_freq)
 
 
 @cli.command()
@@ -161,6 +162,29 @@ def validate(ctx, fix):
 
     if not fix and results["invalid"] > 0:
         print(f"\nRun 'vault-agent validate --fix' to auto-correct fixable targets and remove the rest.")
+
+
+@cli.command(name="clean-links")
+@click.pass_context
+def clean_links(ctx):
+    """Remove duplicate and self-referencing links from proposals."""
+    from vault_agent.state import VaultState
+
+    vault_path = ctx.obj["vault_path"]
+    state = VaultState(vault_path)
+
+    dupes = state.deduplicate_links()
+    self_links = state.remove_self_links()
+
+    print(f"Removed {dupes} duplicate link(s)")
+    print(f"Removed {self_links} self-referencing link(s)")
+
+    if dupes or self_links:
+        # Re-validate after cleanup
+        results = state.validate_links()
+        print(f"\nRemaining links: {results['valid']} valid, {results['invalid']} invalid")
+    else:
+        print("\nNo issues found.")
 
 
 @cli.command(name="normalize-tags")

@@ -226,8 +226,15 @@ class Agent:
                 index.setdefault(tag, []).append(path)
         return index
 
-    def _find_candidate_pairs(self, min_shared_tags: int = 2) -> list[tuple[str, str, list[str]]]:
+    def _find_candidate_pairs(
+        self, min_shared_tags: int = 2, max_tag_frequency: int = 0,
+    ) -> list[tuple[str, str, list[str]]]:
         """Find pairs of notes that share at least min_shared_tags tags.
+
+        Args:
+            min_shared_tags: Minimum number of shared tags to consider a pair.
+            max_tag_frequency: If > 0, ignore tags that appear on more than this
+                many notes (they're too generic to indicate real connections).
 
         Returns list of (note_a, note_b, shared_tags) sorted by overlap count descending.
         """
@@ -235,6 +242,21 @@ class Agent:
         pairs: dict[tuple[str, str], list[str]] = {}
 
         tag_index = self._build_tag_index()
+
+        # Filter out overly common tags
+        skipped_tags = []
+        if max_tag_frequency > 0:
+            for tag in list(tag_index.keys()):
+                if len(tag_index[tag]) > max_tag_frequency:
+                    skipped_tags.append((tag, len(tag_index[tag])))
+                    del tag_index[tag]
+            if skipped_tags:
+                skipped_tags.sort(key=lambda x: -x[1])
+                print(f"Skipping {len(skipped_tags)} overly common tag(s):")
+                for tag, count in skipped_tags:
+                    print(f"  #{tag} ({count} notes)")
+                print()
+
         for tag, note_paths in tag_index.items():
             for i, a in enumerate(note_paths):
                 for b in note_paths[i + 1:]:
@@ -313,7 +335,7 @@ Respond with JSON only:
             self._log(f"Failed to parse link confirmation: {raw[:200]}")
             return None
 
-    def discover_links(self, min_shared_tags: int = 2) -> dict:
+    def discover_links(self, min_shared_tags: int = 2, max_tag_frequency: int = 0) -> dict:
         """Discover links between notes based on tag overlap, confirmed by LLM.
 
         Resumable — tracks evaluated pairs in state so interrupted runs
@@ -321,7 +343,7 @@ Respond with JSON only:
 
         Returns a summary dict.
         """
-        candidates = self._find_candidate_pairs(min_shared_tags)
+        candidates = self._find_candidate_pairs(min_shared_tags, max_tag_frequency)
 
         if not candidates:
             print(f"No note pairs found with {min_shared_tags}+ shared tags.")
@@ -391,16 +413,18 @@ Respond with JSON only:
                     link_to = result.get("link_to", note_b)
                     reason = result.get("reason", "")
 
-                    # Store in state under the source note
+                    # Store in state, skipping duplicates
                     note_info = self.state.data["notes"].get(link_from, {})
                     existing_links = note_info.get("proposed_links", [])
-                    existing_links.append({
-                        "target": link_to,
-                        "reason": reason,
-                    })
-                    note_info["proposed_links"] = existing_links
-                    note_info["links_applied"] = False
-                    self.state.data["notes"][link_from] = note_info
+                    existing_targets = {l.get("target") for l in existing_links}
+                    if link_to not in existing_targets:
+                        existing_links.append({
+                            "target": link_to,
+                            "reason": reason,
+                        })
+                        note_info["proposed_links"] = existing_links
+                        note_info["links_applied"] = False
+                        self.state.data["notes"][link_from] = note_info
 
                     print(f"  -> LINK: [[{Path(link_to).stem}]] in {link_from}")
                     print(f"     Reason: {reason}")
